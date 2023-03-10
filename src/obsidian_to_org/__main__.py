@@ -4,22 +4,36 @@ import argparse
 import pathlib
 import re
 import subprocess
-import sys
 import tempfile
 import uuid
 import shutil
+from collections import defaultdict
 
 
 COMMENT_MARKER = "#!#comment:"
 RULER_RE = re.compile(r"^---\n(.+)", re.MULTILINE)
-LINK_RE = re.compile(r"\[\[([^|\[]*?)\]\]")
-LINK_DESCRIPTION_RE = re.compile(r"\[\[(.*?)\|(.*?)\]\]")
+LINK_RE = re.compile(r"\[\[([^|\[\.]*?)\]\]")
+LINK_DESCRIPTION_RE = re.compile(r"\[\[([^\.]*?)\|(.*?)\]\]")
+# E.g., ![[myimage.png]]
+IMAGE_RE = re.compile(r"!?\[\[(?:[^|\[\]\.]*/)?([^/\]]+\.(png|jpe?g|svg|gif))\]\]")
+PDF_RE = re.compile(r"!?\[\[(?:[^|\[\]\.]*/)?([^/\]]+\.(pdf|PDF))\]\]")
 
 # See https://help.obsidian.md/How+to/Working+with+tags#Allowed+characters
 TAGS_RE = re.compile(r"#([A-Za-z][A-Za-z0-9/_-]*)")
 
 # For example, [[file:foo.org][The Title is Foo]]
 FILE_LINK_RE = re.compile(r"\[\[file:(.*?)\]\[(.*?)\]\]")
+
+
+def fix_markdown_code_blocks(markdown_contents):
+    """Convert special Obsidian code blocks."""
+    # Replace blocks of the form run-<language> from Execute Code plugin
+    # with normal <language> blocks
+    markdown_contents = re.sub(r"```run-(.*)", r"```\1", markdown_contents)
+    # Convert sh to shell blocks
+    markdown_contents = markdown_contents.replace("```sh", "```shell")
+
+    return markdown_contents
 
 
 def fix_markdown_comments(markdown_contents):
@@ -52,15 +66,19 @@ def restore_comments(org_contents):
 
 def prepare_markdown_text(markdown_contents):
     markdown_contents = fix_markdown_comments(markdown_contents)
-
-    # Ensure space after "---"
-    return RULER_RE.sub(r"---\n\n\1", markdown_contents)
+    markdown_contents = fix_markdown_code_blocks(markdown_contents)
+    return markdown_contents
 
 
 def fix_links(org_contents):
     """Convert all kinds of links."""
     org_contents = LINK_RE.sub(r"[[file:\1.org][\1]]", org_contents)
     org_contents = LINK_DESCRIPTION_RE.sub(r"[[file:\1.org][\2]]", org_contents)
+    # I have org-roam-images set in org-link-abbrev-alist to point to where
+    # all org roam images are stored. Similar for pdfs.
+    org_contents = IMAGE_RE.sub(r"[[org-roam-images:\1]]", org_contents)
+    org_contents = PDF_RE.sub(r"[[org-roam-attachments:\1]]", org_contents)
+    org_contents = org_contents.replace("%20", " ")
     return org_contents
 
 
@@ -84,7 +102,7 @@ def convert_markdown_file(md_file, org_file):
         subprocess.run(
             [
                 "pandoc",
-                "--from=markdown-auto_identifiers",
+                "--from=markdown-tex_math_dollars-auto_identifiers",
                 "--to=org",
                 "--wrap=preserve",
                 "--output",
@@ -109,6 +127,38 @@ def walk_directory(path):
         yield p.resolve()
 
 
+def maybeSplitList(s):
+    """If the string s represents a list, create a list. Otherwise return as is"""
+    if len(s) > 0 and (s.startswith("[") or "," in s):
+        if s.startswith("["):
+            s = s[1:-1]
+        # Split at whitespace or commas, respecting quotes
+        s = re.findall(r'(?:[^\s,"]|"(?:\\.|[^"])*")+', s)
+        return s
+    return s
+
+
+def get_keys(content):
+    """Return a dictionary of all the YAML keys and values"""
+    lines = content.split("\n")
+    frontmatter = defaultdict(lambda: "")
+    if not lines or lines[0] != "---":
+        return frontmatter
+    for i in range(1, len(lines)):
+        if lines[i] == "---\n":
+            break
+        key = lines[i].split(":")[0]
+        val = ":".join(lines[i].split(":")[1:]).strip()
+        if not val:
+            continue
+        if key != "title":
+            val = maybeSplitList(val)
+        if key in ["tags", "aliases"] and not isinstance(val, list):
+            val = [val]  # always use a list for tags / aliases
+        frontmatter[key] = val
+    return frontmatter
+
+
 def single_file():
     parser = argparse.ArgumentParser(
         description="Convert an Obsidian Markdown file into org-mode"
@@ -117,6 +167,7 @@ def single_file():
         "markdown_file", type=pathlib.Path, help="The Markdown file to convert"
     )
     args = parser.parse_args()
+    md_file = args.markdown_file
 
     # TODO: Make this an argument.
     output_dir = pathlib.Path("out")
@@ -128,17 +179,37 @@ def single_file():
     print(f"Converted {md_file} to {org_file}")
 
 
-def add_node_id(org_file, node_id):
+def add_node_id(org_file, node_id, frontmatter):
     contents = org_file.read_text()
-    tags = ":".join(set(find_tags_in_markdown(contents)))
+    basename = org_file.stem
+    tags = ":".join(frontmatter["tags"])
+    aliases = " ".join(frontmatter["aliases"])
+    title = basename
+    if "title" in frontmatter and not basename.startswith("@"):
+        title = frontmatter["title"]
+        if title.startswith('"'):
+            title = title[1:-1]
     with org_file.open("w") as fp:
         fp.write(":PROPERTIES:\n")
         fp.write(f":ID: {node_id}\n")
+
+        if aliases:
+            fp.write(f":ROAM_ALIASES: {aliases}\n")
+
+        if basename.startswith("@"):  # reference notes
+            fp.write(f":ROAM_REFS: [cite:{basename}]\n")
+
         fp.write(":END:\n")
-        fp.write(f"#+title: {org_file.stem}\n")
+
+        fp.write(f"#+title: {title}\n")
+
+        if "date-created" in frontmatter:
+            fp.write(f'#+created: [{frontmatter["date-created"]}]\n')
+
         if tags:
             fp.write(f"#+filetags: :{tags}:\n")
-        fp.write("\n")
+
+        fp.write("\n\n")
         fp.write(contents)
 
 
@@ -160,9 +231,30 @@ def convert_directory():
         type=pathlib.Path,
         help="The directory to put the org files in",
     )
+    parser.add_argument(
+        "--skip_dirs",
+        type=str,
+        help="regex of directories to ignore",
+        default="",
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=pathlib.Path,
+        help="path to output image files",
+        default=None,
+    )
+    parser.add_argument(
+        "--pdf_dir",
+        type=pathlib.Path,
+        help="path to output linked pdf files",
+        default=None,
+    )
     args = parser.parse_args()
 
     markdown_directory = args.markdown_directory.resolve()
+    skip_dirs = re.compile(args.skip_dirs)
+    image_dir = args.image_dir
+    pdf_dir = args.pdf_dir
 
     if not args.output_directory.is_dir():
         args.output_directory.mkdir()
@@ -170,12 +262,19 @@ def convert_directory():
     nodes = {}
 
     for path in walk_directory(markdown_directory):
-        if path.name == ".DS_Store":
+        if path.name == ".DS_Store" or re.search(skip_dirs, str(path)):
             continue
 
         if path.suffix != ".md":
-            copy_to = path.relative_to(markdown_directory)
-            copy_path = args.output_directory / copy_to
+            if path.suffix in [".png", ".jpg", ".jpeg", ".svg", ".gif"] and image_dir:
+                copy_path = (
+                    image_dir / path.name
+                )  # args.output_directory / os.path.join("images", path.name)
+            elif path.suffix in [".pdf", ".PDF"] and pdf_dir:
+                copy_path = pdf_dir / path.name
+            else:
+                copy_to = path.relative_to(markdown_directory)
+                copy_path = args.output_directory / copy_to
             print(f"Copying from {path} to {copy_path}")
             copy_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(str(path), str(copy_path))
@@ -184,8 +283,9 @@ def convert_directory():
         org_path = args.output_directory / org_filename
         org_path.parent.mkdir(parents=True, exist_ok=True)
         convert_markdown_file(path, org_path)
+        frontmatter = get_keys(path.read_text())
         nodes[org_filename.stem] = node_id = str(uuid.uuid4()).upper()
-        add_node_id(org_path, node_id)
+        add_node_id(org_path, node_id, frontmatter)
         print(f"Converted {path} to {org_filename}")
 
     for org_path in walk_directory(args.output_directory):
