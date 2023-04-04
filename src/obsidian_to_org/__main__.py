@@ -84,12 +84,11 @@ def fix_links(org_contents):
 
 def convert_file_links_to_id_links(org_contents, nodes):
     def replace_with_id(match):
-        node_id = nodes.get(pathlib.Path(match.group(1)).stem)
+        file_name = match.group(1).replace("%20", " ")  # Handle spaces in filenames
+        node_id = nodes.get(pathlib.Path(file_name).stem)
         if not node_id:
             return match.group(0)
         return f"[[id:{node_id}][{match.group(2)}]]"
-
-    return FILE_LINK_RE.sub(replace_with_id, org_contents)
 
 
 def convert_markdown_file(md_file, org_file):
